@@ -34,10 +34,16 @@ class FakeEngine:
 
     def transcribe_samples(self, samples: np.ndarray, **kwargs: Any) -> str | TranscriptionResult:
         self.last_kwargs = kwargs
+        language = kwargs.get("language") or "English"
         duration_ms = max(1, int(len(samples) / 16))
-        seg = SegmentResult(0, duration_ms, "hello world")
+        words = (
+            [WordTimestamp("hello", 0, 400), WordTimestamp("world", 420, 900)]
+            if self.aligner_model
+            else []
+        )
+        seg = SegmentResult(0, duration_ms, "hello world", words=words)
         if kwargs.get("return_result"):
-            return result_from_segments("English", duration_ms, [seg])
+            return result_from_segments(str(language), duration_ms, [seg])
         return "hello world"
 
     def align_samples(self, samples: np.ndarray, transcript: str, language: str) -> list[WordTimestamp]:
@@ -65,6 +71,8 @@ def test_docs_and_openapi(client: TestClient) -> None:
     paths = spec.json()["paths"]
     assert "/v1/transcribe" in paths
     assert "/v1/align" in paths
+    assert "/v1/audio/transcriptions" in paths
+    assert "/v1/audio/translations" in paths
     root = client.get("/", follow_redirects=False)
     assert root.status_code in {307, 302}
     assert root.headers["location"].endswith("/docs")
@@ -85,8 +93,18 @@ def test_health_and_metadata(client: TestClient) -> None:
     assert {"en", "zh", "ja"} <= codes
 
     models = client.get("/v1/models")
-    names = {item["name"] for item in models.json()}
-    assert "qwen3-asr-0.6b" in names
+    body = models.json()
+    assert body["object"] == "list"
+    ids = {item["id"] for item in body["data"]}
+    assert "whisper-1" in ids
+    assert "qwen3-asr-0.6b" in ids
+    retrieved = client.get("/v1/models/whisper-1")
+    assert retrieved.status_code == 200
+    assert retrieved.json()["id"] == "whisper-1"
+    assert retrieved.json()["object"] == "model"
+    alias = client.get("/models")
+    assert alias.status_code == 200
+    assert alias.json()["object"] == "list"
 
 
 def test_transcribe_upload(client: TestClient) -> None:
@@ -150,3 +168,110 @@ def test_align_with_aligner(align_client: TestClient) -> None:
     assert body["words"][0]["text"] == "hello"
     assert body["words"][0]["start"] == 0.0
     assert body["words"][0]["end"] == 0.4
+
+
+def _wav() -> bytes:
+    tone = np.sin(np.linspace(0, 8 * np.pi, 16000)).astype(np.float32) * 0.2
+    return _pcm16_wav(tone)
+
+
+def test_openai_transcriptions_json(client: TestClient) -> None:
+    response = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("tone.wav", _wav(), "audio/wav")},
+        data={"model": "whisper-1", "language": "en"},
+        headers={"Authorization": "Bearer sk-not-needed"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {"text": "hello world"}
+
+
+def test_openai_transcriptions_text_srt_vtt(client: TestClient) -> None:
+    wav = _wav()
+    text = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("tone.wav", wav, "audio/wav")},
+        data={"model": "whisper-1", "response_format": "text"},
+    )
+    assert text.status_code == 200
+    assert text.text == "hello world"
+
+    srt = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("tone.wav", wav, "audio/wav")},
+        data={"model": "whisper-1", "response_format": "srt"},
+    )
+    assert srt.status_code == 200
+    assert "hello world" in srt.text
+
+    vtt = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("tone.wav", wav, "audio/wav")},
+        data={"model": "whisper-1", "response_format": "vtt"},
+    )
+    assert vtt.status_code == 200
+    assert vtt.text.startswith("WEBVTT")
+
+
+def test_openai_transcriptions_verbose_json_and_words(align_client: TestClient) -> None:
+    response = align_client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("tone.wav", _wav(), "audio/wav")},
+        data={
+            "model": "whisper-1",
+            "response_format": "verbose_json",
+            "timestamp_granularities[]": ["word", "segment"],
+        },
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task"] == "transcribe"
+    assert body["language"] == "english"
+    assert body["text"] == "hello world"
+    assert body["segments"]
+    assert body["words"][0]["word"] == "hello"
+    assert body["words"][0]["start"] == 0.0
+
+
+def test_openai_transcriptions_alias_path_and_errors(client: TestClient) -> None:
+    ok = client.post(
+        "/audio/transcriptions",
+        files={"file": ("tone.wav", _wav(), "audio/wav")},
+        data={"model": "whisper-1"},
+    )
+    assert ok.status_code == 200
+    assert ok.json()["text"] == "hello world"
+
+    bad_format = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("tone.wav", _wav(), "audio/wav")},
+        data={"model": "whisper-1", "response_format": "pdf"},
+    )
+    assert bad_format.status_code == 400
+    assert bad_format.json()["error"]["type"] == "invalid_request_error"
+
+    streamed = client.post(
+        "/v1/audio/transcriptions",
+        files={"file": ("tone.wav", _wav(), "audio/wav")},
+        data={"model": "whisper-1", "stream": "true"},
+    )
+    assert streamed.status_code == 400
+    assert "stream" in streamed.json()["error"]["message"]
+
+
+def test_openai_translations_into_english() -> None:
+    engine = FakeEngine()
+    with TestClient(create_app(engine)) as client:
+        response = client.post(
+            "/v1/audio/translations",
+            files={"file": ("tone.wav", _wav(), "audio/wav")},
+            data={"model": "whisper-1", "response_format": "verbose_json"},
+        )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task"] == "translate"
+    assert body["language"] == "english"
+    assert body["text"] == "hello world"
+    assert engine.last_kwargs is not None
+    assert engine.last_kwargs["language"] == "English"

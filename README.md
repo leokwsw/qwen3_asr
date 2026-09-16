@@ -56,14 +56,57 @@ Then open:
 | `GET` | `/health` | Service and loaded model |
 | `GET` | `/v1/info` | Model, languages, known checkpoints |
 | `GET` | `/v1/languages` | Supported languages |
-| `GET` | `/v1/models` | Known model aliases |
-| `POST` | `/v1/transcribe` | Upload audio/video and transcribe |
+| `GET` | `/v1/models` | OpenAI-compatible model list (`whisper-1`, aliases) |
+| `POST` | `/v1/audio/transcriptions` | OpenAI-compatible transcription |
+| `POST` | `/v1/audio/translations` | OpenAI-compatible translation into English |
+| `POST` | `/v1/transcribe` | Native upload transcription |
 | `POST` | `/v1/align` | Forced alignment (needs `--aligner-dir`) |
 
 ```bash
 curl -sS -F "file=@audio.wav" -F "language=zh" http://127.0.0.1:8000/v1/transcribe
 curl -sS http://127.0.0.1:8000/health
 ```
+
+### OpenAI SDK
+
+Point `base_url` at this server. Any API key is accepted (the SDK requires a string). `model` is ignored and the process-loaded checkpoint is used; `whisper-1` works as a drop-in name.
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="dummy")
+
+with open("audio.wav", "rb") as audio:
+    transcript = client.audio.transcriptions.create(
+        model="whisper-1",
+        file=audio,
+        language="zh",
+    )
+print(transcript.text)
+
+with open("audio.wav", "rb") as audio:
+    translation = client.audio.translations.create(
+        model="whisper-1",
+        file=audio,
+    )
+print(translation.text)
+```
+
+```bash
+curl http://127.0.0.1:8000/v1/audio/transcriptions \
+  -H "Authorization: Bearer dummy" \
+  -F file=@audio.wav \
+  -F model=whisper-1 \
+  -F language=zh
+
+curl http://127.0.0.1:8000/v1/audio/translations \
+  -H "Authorization: Bearer dummy" \
+  -F file=@audio.wav \
+  -F model=whisper-1 \
+  -F response_format=verbose_json
+```
+
+`response_format` supports `json` (default), `text`, `srt`, `verbose_json`, and `vtt`. Word timestamps need `--aligner-dir` and `timestamp_granularities[]=word`.
 
 Environment overrides: `QWEN3_ASR_MODEL`, `QWEN3_ASR_ALIGNER`, `QWEN3_ASR_HOST`, `QWEN3_ASR_PORT`, `QWEN3_ASR_MAX_UPLOAD_MB` (default 100). Keep a single Uvicorn worker; extra workers reload the model into RAM again.
 

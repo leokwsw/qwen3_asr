@@ -11,17 +11,26 @@ from contextlib import asynccontextmanager
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from typing import Annotated, Any
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, Response
 from pydantic import BaseModel, Field
 
 from . import audio
 from .download import KNOWN_MODELS
 from .engine import AsrEngine, configure_cpu_threads
 from .languages import LANGUAGE_TABLE, normalize_language, supported_language_list
+from .openai_compat import (
+    OPENAI_RESPONSE_FORMATS,
+    OpenAIModel,
+    OpenAIModelList,
+    cues_from_result,
+    format_openai_audio_response,
+    openai_error,
+    openai_model_catalog,
+)
 from .output import TranscriptionResult, WordTimestamp, count_words
-from .subtitle import format_srt, group_words_to_cues, segment_to_cue
+from .subtitle import format_srt
 
 
 def _package_version() -> str:
@@ -99,17 +108,7 @@ class InfoResponse(HealthResponse):
 
 
 def _result_to_response(result: TranscriptionResult, *, include_srt: bool, inference_ms: float | None) -> TranscribeResponse:
-    if any(seg.words for seg in result.segments):
-        cues = group_words_to_cues(
-            [
-                {"text": w.word, "start_ms": w.start_ms, "end_ms": w.end_ms}
-                for seg in result.segments
-                for w in seg.words
-            ],
-            result.duration_ms,
-        )
-    else:
-        cues = [segment_to_cue(s.start_ms, s.end_ms, s.text) for s in result.segments]
+    cues = cues_from_result(result)
     return TranscribeResponse(
         transcription_info=TranscriptionInfo(
             language=result.language,
@@ -188,6 +187,69 @@ def _parse_language(language: str | None) -> str | None:
     return lang
 
 
+def _http_detail(exc: HTTPException) -> str:
+    detail = exc.detail
+    return detail if isinstance(detail, str) else str(detail)
+
+
+async def _transcribe_upload(
+    app: FastAPI,
+    file: UploadFile,
+    *,
+    language: str | None,
+    prompt: str | None,
+    segment_sec: float = 0.0,
+    search_sec: float = 3.0,
+    stream: bool = False,
+    stream_chunk_sec: float = 2.0,
+    skip_silence: bool = False,
+    max_new_tokens: int = 0,
+) -> TranscriptionResult:
+    state = _require_engine(app)
+    lang = _parse_language(language)
+    data = await _read_upload(file, state.max_upload_bytes)
+    samples = await asyncio.to_thread(_decode_audio, data, file.filename)
+
+    def _run() -> TranscriptionResult:
+        with state.lock:
+            previous = state.engine.max_new_tokens
+            if max_new_tokens > 0:
+                state.engine.max_new_tokens = max_new_tokens
+            try:
+                result = state.engine.transcribe_samples(
+                    samples,
+                    language=lang,
+                    prompt=prompt,
+                    stream=stream,
+                    stream_chunk_sec=stream_chunk_sec,
+                    segment_sec=segment_sec,
+                    search_sec=search_sec,
+                    skip_silence=skip_silence,
+                    return_result=True,
+                )
+            finally:
+                state.engine.max_new_tokens = previous
+        assert isinstance(result, TranscriptionResult)
+        return result
+
+    try:
+        return await asyncio.to_thread(_run)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
+
+
+async def _form_granularities(request: Request) -> list[str] | None:
+    form = await request.form()
+    values = form.getlist("timestamp_granularities[]") or form.getlist("timestamp_granularities")
+    if not values:
+        return None
+    return [str(v) for v in values]
+
+
 def create_app(engine: AsrEngine) -> FastAPI:
     """Build a FastAPI app around a preloaded CPU ASR engine."""
 
@@ -203,6 +265,8 @@ def create_app(engine: AsrEngine) -> FastAPI:
         summary="CPU-only Qwen3-ASR speech-to-text HTTP API",
         description=(
             "Upload audio and get transcriptions from Qwen3-ASR running on CPU.\n\n"
+            "- OpenAI-compatible: `POST /v1/audio/transcriptions` and `POST /v1/audio/translations`\n"
+            "- Point the OpenAI SDK at `http://HOST:PORT/v1` and keep `model=\"whisper-1\"`\n"
             "- Interactive docs: `/docs` (Swagger UI) and `/redoc`\n"
             "- Model is loaded once at process start and reused for every request\n"
             "- Inference is serialized (one transcription at a time) to avoid CPU oversubscription"
@@ -212,8 +276,9 @@ def create_app(engine: AsrEngine) -> FastAPI:
         contact={"name": "qwen3-asr"},
         license_info={"name": "MIT"},
         openapi_tags=[
+            {"name": "openai", "description": "OpenAI Audio API compatible endpoints"},
             {"name": "service", "description": "Health and model metadata"},
-            {"name": "asr", "description": "Speech-to-text and forced alignment"},
+            {"name": "asr", "description": "Native speech-to-text and forced alignment"},
         ],
     )
     app.state.asr = engine_state
@@ -268,9 +333,92 @@ def create_app(engine: AsrEngine) -> FastAPI:
     def languages() -> list[LanguageOut]:
         return [LanguageOut(name=name, code=code) for name, code in LANGUAGE_TABLE]
 
-    @app.get("/v1/models", response_model=list[ModelOut], tags=["service"])
-    def models() -> list[ModelOut]:
-        return [ModelOut(name=m.name, repo=m.repo, description=m.description) for m in KNOWN_MODELS]
+    @app.get("/v1/models", response_model=OpenAIModelList, tags=["openai"])
+    @app.get("/models", response_model=OpenAIModelList, include_in_schema=False)
+    def models() -> OpenAIModelList:
+        state = _require_engine(app)
+        return OpenAIModelList(data=openai_model_catalog(state.engine.model_id))
+
+    @app.get("/v1/models/{model_id}", response_model=OpenAIModel, tags=["openai"])
+    @app.get("/models/{model_id}", response_model=OpenAIModel, include_in_schema=False)
+    def model_retrieve(model_id: str) -> OpenAIModel:
+        return OpenAIModel(id=model_id)
+
+    @app.post(
+        "/v1/audio/transcriptions",
+        tags=["openai"],
+        summary="OpenAI-compatible audio transcriptions",
+        response_class=Response,
+    )
+    @app.post("/audio/transcriptions", include_in_schema=False, response_class=Response)
+    async def openai_transcriptions(
+        request: Request,
+        file: Annotated[UploadFile, File(description="Audio file (same field name as OpenAI)")],
+        model: Annotated[str, Form(description="Accepted for SDK compatibility; the loaded server model is used")] = "whisper-1",
+        language: Annotated[str | None, Form(description="ISO-639-1 or English name, e.g. en / zh / Japanese")] = None,
+        prompt: Annotated[str | None, Form(description="Optional text to bias decoding")] = None,
+        response_format: Annotated[str, Form(description="json, text, srt, verbose_json, or vtt")] = "json",
+        temperature: Annotated[float, Form(description="Ignored; decoding is greedy")] = 0.0,
+        stream: Annotated[bool, Form(description="Streaming is not supported")] = False,
+    ) -> Response:
+        _ = model
+        if stream:
+            return openai_error(400, "stream=true is not supported. Use response_format=json.")
+        fmt = (response_format or "json").strip().lower()
+        if fmt not in OPENAI_RESPONSE_FORMATS:
+            return openai_error(
+                400,
+                f"Invalid response_format '{response_format}'. "
+                "Supported: json, text, srt, verbose_json, vtt.",
+            )
+        try:
+            grains = await _form_granularities(request)
+            result = await _transcribe_upload(app, file, language=language, prompt=prompt)
+        except HTTPException as exc:
+            return openai_error(exc.status_code, _http_detail(exc))
+        return format_openai_audio_response(
+            result,
+            response_format=response_format,
+            task="transcribe",
+            timestamp_granularities=grains,
+            temperature=temperature,
+        )
+
+    @app.post(
+        "/v1/audio/translations",
+        tags=["openai"],
+        summary="OpenAI-compatible audio translations (into English)",
+        response_class=Response,
+    )
+    @app.post("/audio/translations", include_in_schema=False, response_class=Response)
+    async def openai_translations(
+        file: Annotated[UploadFile, File(description="Audio file (same field name as OpenAI)")],
+        model: Annotated[str, Form(description="Accepted for SDK compatibility; the loaded server model is used")] = "whisper-1",
+        prompt: Annotated[str | None, Form(description="Optional text to bias decoding")] = None,
+        response_format: Annotated[str, Form(description="json, text, srt, verbose_json, or vtt")] = "json",
+        temperature: Annotated[float, Form(description="Ignored; decoding is greedy")] = 0.0,
+        stream: Annotated[bool, Form(description="Streaming is not supported")] = False,
+    ) -> Response:
+        _ = model
+        if stream:
+            return openai_error(400, "stream=true is not supported. Use response_format=json.")
+        fmt = (response_format or "json").strip().lower()
+        if fmt not in OPENAI_RESPONSE_FORMATS:
+            return openai_error(
+                400,
+                f"Invalid response_format '{response_format}'. "
+                "Supported: json, text, srt, verbose_json, vtt.",
+            )
+        try:
+            result = await _transcribe_upload(app, file, language="en", prompt=prompt)
+        except HTTPException as exc:
+            return openai_error(exc.status_code, _http_detail(exc))
+        return format_openai_audio_response(
+            result,
+            response_format=response_format,
+            task="translate",
+            temperature=temperature,
+        )
 
     @app.post(
         "/v1/transcribe",
@@ -294,40 +442,19 @@ def create_app(engine: AsrEngine) -> FastAPI:
         include_srt: Annotated[bool, Form(description="Include SRT subtitle text in the response")] = False,
         max_new_tokens: Annotated[int, Form(description="Max generated tokens (0 = auto)")] = 0,
     ) -> TranscribeResponse:
+        result = await _transcribe_upload(
+            app,
+            file,
+            language=language,
+            prompt=prompt,
+            segment_sec=segment_sec,
+            search_sec=search_sec,
+            stream=stream,
+            stream_chunk_sec=stream_chunk_sec,
+            skip_silence=skip_silence,
+            max_new_tokens=max_new_tokens,
+        )
         state = _require_engine(app)
-        lang = _parse_language(language)
-        data = await _read_upload(file, state.max_upload_bytes)
-        samples = await asyncio.to_thread(_decode_audio, data, file.filename)
-
-        def _run() -> TranscriptionResult:
-            with state.lock:
-                previous = state.engine.max_new_tokens
-                if max_new_tokens > 0:
-                    state.engine.max_new_tokens = max_new_tokens
-                try:
-                    result = state.engine.transcribe_samples(
-                        samples,
-                        language=lang,
-                        prompt=prompt,
-                        stream=stream,
-                        stream_chunk_sec=stream_chunk_sec,
-                        segment_sec=segment_sec,
-                        search_sec=search_sec,
-                        skip_silence=skip_silence,
-                        return_result=True,
-                    )
-                finally:
-                    state.engine.max_new_tokens = previous
-            assert isinstance(result, TranscriptionResult)
-            return result
-
-        try:
-            result = await asyncio.to_thread(_run)
-        except ValueError as exc:
-            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
-        except Exception as exc:
-            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-
         inference_ms = getattr(getattr(state.engine, "timing", None), "total_ms", None)
         return _result_to_response(result, include_srt=include_srt, inference_ms=inference_ms)
 
@@ -423,6 +550,7 @@ def handle_serve_command(argv: list[str]) -> int:
 
     app = create_app(engine)
     print(f"Swagger UI: http://{args.host}:{args.port}/docs", file=sys.stderr)
+    print(f"OpenAI SDK base_url: http://{args.host}:{args.port}/v1", file=sys.stderr)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
     return 0
 
