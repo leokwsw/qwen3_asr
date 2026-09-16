@@ -24,6 +24,80 @@ The Hugging Face Qwen3-ASR models need a recent `transformers` (5.13+ recommende
 pip install -U "transformers>=5.13.0"
 ```
 
+## Build, develop, deployment
+
+This is a pure-Python package (`qwen3-asr-cpu`). There is no CMake/compiler step. “Build” means install the package or produce a wheel.
+
+### Develop
+
+Editable install so local edits are picked up immediately:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -U pip
+pip install -e ".[dev,live]"
+python -m pytest -q
+qwen3-asr -h
+qwen3-asr serve -h
+```
+
+Extras: `[dev]` (pytest/httpx), `[live]` (microphone), `[serve]` (already in core deps).
+
+### Build
+
+Create installable artifacts in `dist/`:
+
+```bash
+pip install build
+python -m build
+ls dist/
+# qwen3_asr_cpu-0.1.2-py3-none-any.whl
+# qwen3_asr_cpu-0.1.2.tar.gz
+```
+
+Install from the wheel:
+
+```bash
+pip install dist/qwen3_asr_cpu-*.whl
+```
+
+### Deployment
+
+1. Install the wheel (or `pip install -e .`) on the host.
+2. Download Hugging Face weights once (needs network, or copy a local model dir).
+3. Run **one** Uvicorn worker. Extra workers load another full copy of the model into RAM.
+
+```bash
+qwen3-asr download qwen3-asr-0.6b --output /var/lib/qwen3-asr/qwen3-asr-0.6b
+
+export QWEN3_ASR_MODEL=/var/lib/qwen3-asr/qwen3-asr-0.6b
+export QWEN3_ASR_HOST=0.0.0.0
+export QWEN3_ASR_PORT=8000
+# optional
+# export QWEN3_ASR_ALIGNER=/var/lib/qwen3-asr/qwen3-aligner-0.6b
+# export QWEN3_ASR_MAX_UPLOAD_MB=100
+
+qwen3-asr serve -d "$QWEN3_ASR_MODEL" --host 0.0.0.0 --port 8000
+```
+
+Check:
+
+- Swagger UI: `http://<host>:8000/docs`
+- OpenAI SDK `base_url`: `http://<host>:8000/v1`
+- Health: `curl -sS http://<host>:8000/health`
+
+Example systemd unit:
+
+```ini
+[Service]
+ExecStart=/opt/qwen3-asr/.venv/bin/qwen3-asr serve -d /var/lib/qwen3-asr/qwen3-asr-0.6b --host 0.0.0.0 --port 8000
+Restart=on-failure
+Environment=QWEN3_ASR_MAX_UPLOAD_MB=100
+```
+
+Keep a reverse proxy (nginx/caddy) in front if you need TLS or a public hostname. Do not set Uvicorn `--workers` above 1 unless you have RAM for multiple model copies.
+
 ## Download model
 
 Weights must be in Hugging Face format (`config.json` + processor files).
