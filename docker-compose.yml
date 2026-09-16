@@ -1,0 +1,36 @@
+services:
+  qwen3-asr:
+    build: .
+    image: qwen3-asr:cpu
+    container_name: qwen3-asr
+    restart: unless-stopped
+    ports:
+      - "${QWEN3_ASR_PORT:-8000}:8000"
+    environment:
+      QWEN3_ASR_MODEL: /models/qwen3-asr-0.6b
+      QWEN3_ASR_MODEL_ALIAS: qwen3-asr-0.6b
+      QWEN3_ASR_HOST: 0.0.0.0
+      QWEN3_ASR_PORT: "8000"
+      QWEN3_ASR_MAX_UPLOAD_MB: "${QWEN3_ASR_MAX_UPLOAD_MB:-100}"
+      QWEN3_ASR_THREADS: "${QWEN3_ASR_THREADS:-0}"
+      HF_HOME: /models/hf-cache
+      # HF_TOKEN: ${HF_TOKEN:-}
+      # QWEN3_ASR_ALIGNER: /models/qwen3-aligner-0.6b
+    volumes:
+      - qwen3-models:/models
+    stop_grace_period: 30s
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+
+volumes:
+  qwen3-models:

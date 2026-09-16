@@ -98,6 +98,56 @@ Environment=QWEN3_ASR_MAX_UPLOAD_MB=100
 
 Keep a reverse proxy (nginx/caddy) in front if you need TLS or a public hostname. Do not set Uvicorn `--workers` above 1 unless you have RAM for multiple model copies.
 
+### PM2
+
+One process only (`fork` mode, `instances: 1`). Cluster mode would load the model once per instance.
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e .
+qwen3-asr download qwen3-asr-0.6b
+mkdir -p logs
+
+npm install -g pm2
+pm2 start ecosystem.config.cjs
+pm2 status
+pm2 logs qwen3-asr
+pm2 save
+pm2 startup
+```
+
+Edit `ecosystem.config.cjs` to change the model path, port, or venv location. Useful commands: `pm2 restart qwen3-asr`, `pm2 stop qwen3-asr`.
+
+Do not put PM2 *inside* the Docker image. Use compose `restart: unless-stopped`, or let PM2 start Compose from the host:
+
+```bash
+pm2 start "docker compose up --build" --name qwen3-asr-docker --interpreter none
+```
+
+### Docker
+
+Image is CPU PyTorch. Weights are **not** baked in; the entrypoint downloads them into the `/models` volume on first start (slow). Later starts reuse the volume.
+
+```bash
+docker compose up -d --build
+docker compose logs -f qwen3-asr
+curl -sS http://127.0.0.1:8000/health
+```
+
+Without Compose:
+
+```bash
+docker build -t qwen3-asr:cpu .
+docker run --name qwen3-asr --restart unless-stopped \
+  -p 8000:8000 \
+  -v qwen3-models:/models \
+  -e QWEN3_ASR_MODEL=/models/qwen3-asr-0.6b \
+  qwen3-asr:cpu
+```
+
+Optional aligner: set `QWEN3_ASR_ALIGNER=/models/qwen3-aligner-0.6b` in `docker-compose.yml`. Give the container several GB of RAM (8+ GB recommended for 0.6B). First boot can take several minutes while the checkpoint downloads and loads; `/health` stays down until the model is ready.
+
 ## Download model
 
 Weights must be in Hugging Face format (`config.json` + processor files).

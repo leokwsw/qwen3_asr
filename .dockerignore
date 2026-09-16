@@ -1,0 +1,17 @@
+.venv/
+.git
+.gitignore
+.idea
+.pytest_cache
+.DS_Store
+**/__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+models/
+logs/
+deploy/vercel/
+tests/
+*.md
+!README.md
