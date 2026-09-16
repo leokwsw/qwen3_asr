@@ -1,6 +1,6 @@
 # qwen3-asr
 
-CPU-only Python CLI and library for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B).
+CPU-only Python CLI, HTTP service, and library for [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B).
 
 This is a Transformers + PyTorch **CPU** runtime. Inference always runs on `device=cpu`.
 
@@ -34,6 +34,38 @@ qwen3-asr download qwen3-asr-0.6b
 ```
 
 Known aliases: `qwen3-asr-0.6b`, `qwen3-asr-1.7b`, `qwen3-aligner-0.6b`.
+
+## HTTP service (FastAPI + Swagger UI)
+
+Start a local API after the model is available. The process loads the checkpoint once and reuses it for every request.
+
+```bash
+qwen3-asr serve -d qwen3-asr-0.6b
+# optional word timestamps / /v1/align
+qwen3-asr serve -d qwen3-asr-0.6b --aligner-dir qwen3-aligner-0.6b --host 0.0.0.0 --port 8000
+```
+
+Then open:
+
+- Swagger UI: http://127.0.0.1:8000/docs
+- ReDoc: http://127.0.0.1:8000/redoc
+- OpenAPI JSON: http://127.0.0.1:8000/openapi.json
+
+| Method | Path | Description |
+| --- | --- | --- |
+| `GET` | `/health` | Service and loaded model |
+| `GET` | `/v1/info` | Model, languages, known checkpoints |
+| `GET` | `/v1/languages` | Supported languages |
+| `GET` | `/v1/models` | Known model aliases |
+| `POST` | `/v1/transcribe` | Upload audio/video and transcribe |
+| `POST` | `/v1/align` | Forced alignment (needs `--aligner-dir`) |
+
+```bash
+curl -sS -F "file=@audio.wav" -F "language=zh" http://127.0.0.1:8000/v1/transcribe
+curl -sS http://127.0.0.1:8000/health
+```
+
+Environment overrides: `QWEN3_ASR_MODEL`, `QWEN3_ASR_ALIGNER`, `QWEN3_ASR_HOST`, `QWEN3_ASR_PORT`, `QWEN3_ASR_MAX_UPLOAD_MB` (default 100). Keep a single Uvicorn worker; extra workers reload the model into RAM again.
 
 ## Transcribe
 
@@ -75,6 +107,16 @@ print(result.language, result.text)
 ```
 
 Always on CPU: `model.to("cpu")`. No CUDA or MPS dispatch.
+
+The HTTP app is also usable as a library:
+
+```python
+from qwen3_asr.engine import AsrEngine
+from qwen3_asr.server import create_app
+
+engine = AsrEngine.load("qwen3-asr-0.6b")
+app = create_app(engine)
+```
 
 ## Tests
 

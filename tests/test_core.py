@@ -8,7 +8,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from qwen3_asr.audio import parse_wav_buffer, resample, skip_silence, split_segments
+from qwen3_asr.audio import parse_wav_buffer, resample, skip_silence, split_segments, load_audio_from_bytes
 from qwen3_asr.download import resolve_model_id
 from qwen3_asr.engine import _delta_text, _max_new_tokens
 from qwen3_asr.languages import language_to_iso639, normalize_language
@@ -76,6 +76,9 @@ def test_parse_wav_and_resample() -> None:
     assert abs(len(samples) - 16000) < 2
     up = resample(tone, 8000, 16000)
     assert len(up) == 16000
+    from_bytes = load_audio_from_bytes(wav, "tone.wav")
+    assert from_bytes is not None
+    assert abs(len(from_bytes) - 16000) < 2
 
 
 def test_skip_silence_and_segments() -> None:

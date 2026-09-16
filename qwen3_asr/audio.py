@@ -160,6 +160,46 @@ def load_audio(path: str) -> np.ndarray | None:
     return load_wav(path)
 
 
+def _load_bytes_via_temp(data: bytes, suffix: str) -> np.ndarray | None:
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="qwen3-asr-upload-")
+    try:
+        os.write(fd, data)
+        os.close(fd)
+        fd = -1
+        return load_audio(path)
+    finally:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def load_audio_from_bytes(data: bytes, filename: str = "audio.wav") -> np.ndarray | None:
+    """Decode uploaded audio/video bytes to 16 kHz mono float32."""
+    if not data:
+        return None
+    suffix = Path(filename).suffix.lower()
+    if suffix in VIDEO_EXTENSIONS:
+        return _load_bytes_via_temp(data, suffix)
+    if data[:4] == b"RIFF":
+        samples = parse_wav_buffer(data)
+        if samples is not None:
+            return samples
+    try:
+        import soundfile as sf
+
+        samples, sr = sf.read(io.BytesIO(data), always_2d=True, dtype="float32")
+        return resample(samples.mean(axis=1), int(sr), SAMPLE_RATE)
+    except Exception:
+        pass
+    return _load_bytes_via_temp(data, suffix or ".wav")
+
+
 def read_pcm_stdin() -> np.ndarray | None:
     buf = sys.stdin.buffer.read()
     if len(buf) < 4:

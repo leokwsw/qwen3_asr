@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="qwen3-asr — Qwen3-ASR speech-to-text (Python, CPU-only)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         add_help=False,
+        epilog="Subcommands:\n  download   Download a Hugging Face checkpoint\n  serve      Start the FastAPI HTTP service (Swagger UI at /docs)",
     )
     parser.add_argument("-h", "--help", action="help", help="Show this help")
     parser.add_argument(
@@ -84,6 +85,13 @@ def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv and argv[0] == "download":
         return handle_download_command(argv[1:])
+    if argv and argv[0] == "serve":
+        try:
+            from .server import handle_serve_command
+        except ImportError:
+            print('Missing HTTP extras. Install with: pip install -e ".[serve]"', file=sys.stderr)
+            return 1
+        return handle_serve_command(argv[1:])
 
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -105,6 +113,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.print_help()
         print("\nModel management:", file=sys.stderr)
         print("  qwen3-asr download [--list] [<model>] [--output <dir>]", file=sys.stderr)
+        print("HTTP service:", file=sys.stderr)
+        print("  qwen3-asr serve -d qwen3-asr-0.6b [--host 127.0.0.1] [--port 8000]", file=sys.stderr)
         return 1
 
     input_count = sum(bool(x) for x in (bool(input_files), args.stdin, args.live))

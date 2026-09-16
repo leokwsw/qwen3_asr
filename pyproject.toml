@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qwen3-asr-cpu"
 version = "0.1.2"
-description = "CPU-only Python CLI and library for Qwen3-ASR speech-to-text"
+description = "CPU-only Python CLI, FastAPI HTTP service, and library for Qwen3-ASR speech-to-text"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -17,14 +17,23 @@ dependencies = [
     "numpy>=1.24",
     "soundfile>=0.12",
     "huggingface_hub>=0.23",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.9",
 ]
 
 [project.optional-dependencies]
 live = ["sounddevice>=0.4"]
-dev = ["pytest>=8"]
+serve = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.9",
+]
+dev = ["pytest>=8", "httpx>=0.27"]
 
 [project.scripts]
 qwen3-asr = "qwen3_asr.cli:main"
+qwen3-asr-serve = "qwen3_asr.server:main"
 
 [tool.setuptools.packages.find]
 include = ["qwen3_asr*"]
